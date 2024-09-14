@@ -102,7 +102,8 @@ static struct sk_buff *mc_qdisc_dequeue(struct Qdisc *sch)
 		list_for_each_rcu(pos, &priv->mc_list) {
 			struct mc_sched_data *other_priv = container_of(pos, struct mc_sched_data, mc_list);
 			u64 other_pkts_sent = READ_ONCE(other_priv->packets_sent);
-			if (other_pkts_sent != priv->qdisc_wd_active[other_priv->txq_num]) {
+			u64 other_qlen = READ_ONCE(other_priv->qlen);
+			if (other_qlen || other_pkts_sent != priv->qdisc_wd_active[other_priv->txq_num]) {
 				num_active_qs++;
 			}
 			priv->qdisc_wd_active[other_priv->txq_num] = other_pkts_sent;
