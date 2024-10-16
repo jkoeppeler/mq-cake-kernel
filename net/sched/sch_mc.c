@@ -75,6 +75,7 @@ static struct sk_buff *mc_qdisc_dequeue(struct Qdisc *sch)
 	struct mc_sched_data *priv = qdisc_priv(sch);
 	u64 len;
 	struct list_head *pos;
+	u64 diff=0;
 
 	if (list_empty(&priv->q))	{
 		sch->qstats.backlog++;
@@ -128,9 +129,9 @@ static struct sk_buff *mc_qdisc_dequeue(struct Qdisc *sch)
 		len = div64_ul(len, priv->max_rate);
 
 		if (priv->time_next_packet)
-			len -= min(len/2, now-priv->time_next_packet);
+			diff = (now-priv->time_next_packet);
 
-		priv->time_next_packet = now+len;
+		priv->time_next_packet = (now+len)-diff;
 	}
 	else {
 		if (priv->time_next_packet != priv->last_watchdog ){
