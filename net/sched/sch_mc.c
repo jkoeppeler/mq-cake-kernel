@@ -56,7 +56,7 @@ static int mc_qdisc_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 
 
 	list_add_tail(&skb->list, &priv->q);
-	priv->qlen++;
+	WRITE_ONCE(priv->qlen, priv->qlen+1);
 	sch->qstats.qlen++;
 
 	return ret;
@@ -76,6 +76,7 @@ static struct sk_buff *mc_qdisc_dequeue(struct Qdisc *sch)
 	u64 len;
 	struct list_head *pos;
 	u64 diff=0;
+	sch->qstats.requeues++;
 
 	if (list_empty(&priv->q))	{
 		sch->qstats.backlog++;
@@ -89,9 +90,9 @@ static struct sk_buff *mc_qdisc_dequeue(struct Qdisc *sch)
 	if (priv->max_rate == 0) {
 		s = list_first_entry(&priv->q, struct sk_buff, list);
 		list_del(&s->list);
-		priv->packets_sent++;
 		sch->qstats.qlen--;
-		priv->qlen--;
+		WRITE_ONCE(priv->packets_sent, priv->packets_sent+1);
+		WRITE_ONCE(priv->qlen, priv->qlen-1);
 		return s;
 	}
 	
@@ -104,15 +105,14 @@ static struct sk_buff *mc_qdisc_dequeue(struct Qdisc *sch)
 			struct mc_sched_data *other_priv = container_of(pos, struct mc_sched_data, mc_list);
 			u64 other_pkts_sent = READ_ONCE(other_priv->packets_sent);
 			u64 other_qlen = READ_ONCE(other_priv->qlen);
-			if (other_qlen || other_pkts_sent != priv->qdisc_wd_active[other_priv->txq_num]) {
+			if (other_qlen || other_pkts_sent != READ_ONCE(priv->qdisc_wd_active[other_priv->txq_num])) {
 				num_active_qs++;
 			}
-			priv->qdisc_wd_active[other_priv->txq_num] = other_pkts_sent;
+			WRITE_ONCE(priv->qdisc_wd_active[other_priv->txq_num], other_pkts_sent);
 		}
 		rcu_read_unlock();
 		priv->last_checked_active = now;
 		priv->last_active_qs = num_active_qs;
-		sch->qstats.requeues++;
 		priv->total_nr_of_active_qs += num_active_qs;
 		priv->nr_of_sync_loops++;
 	}
@@ -120,22 +120,24 @@ static struct sk_buff *mc_qdisc_dequeue(struct Qdisc *sch)
 	s = list_first_entry(&priv->q, struct sk_buff, list);
 
 	if (priv->time_next_packet <= now) {
-		priv->qlen--;
+		WRITE_ONCE(priv->qlen, priv->qlen-1);
 		sch->qstats.qlen--;
 		list_del(&s->list);
-		priv->packets_sent++;
+		WRITE_ONCE(priv->packets_sent, priv->packets_sent+1);
 		
 		len = qdisc_pkt_len(s)*NSEC_PER_SEC*(priv->last_active_qs);
 		len = div64_ul(len, priv->max_rate);
 
 		if (priv->time_next_packet)
-			diff = (now-priv->time_next_packet);
+			diff = min(50000ULL, (now-priv->time_next_packet));
+		if (diff == 50000)
+			sch->qstats.overlimits++;
 
 		priv->time_next_packet = (now+len)-diff;
 	}
 	else {
 		if (priv->time_next_packet != priv->last_watchdog ){
-			sch->qstats.overlimits++;
+			// sch->qstats.overlimits++;
 			qdisc_watchdog_schedule_range_ns(&priv->watchdog, priv->time_next_packet, priv->wd_slack);
 			priv->last_watchdog = priv->time_next_packet;
 		}
@@ -161,9 +163,10 @@ static int mc_dump(struct Qdisc *sch, struct sk_buff *skb)
 	if (nla_put_u64_64bit(skb, TCA_MC_PACKETS_SENT, q->packets_sent,1))
 		goto nla_put_failure;
 
-	if (q->nr_of_sync_loops != 0) {
-		active_queues = div_u64(q->total_nr_of_active_qs, q->nr_of_sync_loops);
-	}
+	// if (q->nr_of_sync_loops != 0) {
+	// 	active_queues = div_u64(q->total_nr_of_active_qs, q->nr_of_sync_loops);
+	// }
+	active_queues=q->last_active_qs;
 
 	if (nla_put_u64_64bit(skb, TCA_MC_ACTIVE_Q_AVG, active_queues,1))
 		goto nla_put_failure;
