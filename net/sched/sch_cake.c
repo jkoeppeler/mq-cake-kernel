@@ -263,6 +263,9 @@ struct cake_sched_data {
 	u64 packets_sent;
 	u64 sync_time;
 	u64 active_queues;
+	s64 min_timer_slack;
+	s64 max_timer_slack;
+	s64 avg_timer_slack;
 };
 
 enum {
@@ -1486,6 +1489,7 @@ static int cake_advance_shaper(struct cake_sched_data *q,
 	/* charge packet bandwidth to this tin
 	 * and to the global shaper.
 	 */
+	// pr_err("lent: %u\n", len);
 	if (q->rate_ns) {
 		u64 tin_dur = (len * b->tin_rate_ns) >> b->tin_rate_shft;
 		u64 global_dur = (len * q->rate_ns) >> q->rate_shft;
@@ -1957,6 +1961,18 @@ static void cake_clear_tin(struct Qdisc *sch, u16 tin)
 			kfree_skb(skb);
 }
 
+static inline void cake_update_timer_slack(ktime_t now, ktime_t next, struct cake_sched_data *priv)
+{
+	s64 diff = ktime_to_ns(ktime_sub(now, next));
+	if (diff < 0) {
+		pr_warn("diff is %lli\n", diff);
+		return;
+	}
+	priv->min_timer_slack = min(priv->min_timer_slack,diff);	
+	priv->max_timer_slack = max(priv->max_timer_slack,diff);	
+	priv->avg_timer_slack = cake_ewma(priv->avg_timer_slack, diff, 3);
+}
+
 static struct sk_buff *cake_dequeue(struct Qdisc *sch)
 {
 	struct cake_sched_data *q = qdisc_priv(sch);
@@ -1986,14 +2002,22 @@ static struct sk_buff *cake_dequeue(struct Qdisc *sch)
 			WRITE_ONCE(q->qdisc_wd_active[other_priv->txq_num], other_pkts_sent);
 		}
 		rcu_read_unlock();
-		q->last_checked_active = now;
+
+		// if (q->active_queues == 0) {
+		// 	ktime_t t1 = ktime_get();
+		// 	pr_err("loop time: %llu\n", t1-now);
+		// }
 		if (num_active_qs)
 			new_rate=div64_u64(q->rate_bps, num_active_qs);
+
 		q->active_queues = num_active_qs;
-		cake_set_rate(b, new_rate, 1514, 5000000, 100000000);
+		// mtu = 0 is used to only update the rate and not mess with cobalt params
+		cake_set_rate(b, new_rate, 0, 0, 0);
+		q->last_checked_active = now;
 		q->rate_ns=b->tin_rate_ns;
 		q->rate_shft=b->tin_rate_shft;
 	}
+
 
 begin:
 	if (!sch->q.qlen)
@@ -2010,6 +2034,7 @@ begin:
 		return NULL;
 	}
 
+	cake_update_timer_slack(now, q->time_next_packet, q);
 	/* Choose a class to work on. */
 	if (!q->rate_ns) {
 		/* In unlimited mode, can't rely on shaper timings, just balance
@@ -2294,6 +2319,9 @@ static const struct nla_policy cake_policy[TCA_CAKE_MAX + 1] = {
 	[TCA_CAKE_FWMARK]	 = { .type = NLA_U32 },
 	[TCA_CAKE_SYNC_TIME]	 = { .type = NLA_U32 },
 	[TCA_CAKE_ACTIVE_QUEUES]	 = { .type = NLA_U32 },
+	[TCA_CAKE_MIN_TIMER_SLACK]	 = { .type = NLA_U32 },
+	[TCA_CAKE_MAX_TIMER_SLACK]	 = { .type = NLA_U32 },
+	[TCA_CAKE_AVG_TIMER_SLACK]	 = { .type = NLA_U32 },
 };
 
 static void cake_set_rate(struct cake_tin_data *b, u64 rate, u32 mtu,
@@ -2323,6 +2351,9 @@ static void cake_set_rate(struct cake_tin_data *b, u64 rate, u32 mtu,
 	b->tin_rate_bps  = rate;
 	b->tin_rate_ns   = rate_ns;
 	b->tin_rate_shft = rate_shft;
+
+	if (mtu == 0)
+		return;
 
 	byte_target_ns = (byte_target * rate_ns) >> rate_shft;
 
@@ -2852,6 +2883,8 @@ static int cake_init(struct Qdisc *sch, struct nlattr *opt,
 	pr_err("cake total num: %u\n", lpriv->txq_num+1);
 	pr_err("cake sync_time: %llu\n", q->sync_time);
 	q->active_queues=0;
+	q->last_checked_active = 0;
+	q->min_timer_slack=S64_MAX;
 	return 0;
 }
 
@@ -2923,6 +2956,12 @@ static int cake_dump(struct Qdisc *sch, struct sk_buff *skb)
 	if (nla_put_u32(skb, TCA_CAKE_FWMARK, q->fwmark_mask))
 		goto nla_put_failure;
 	if (nla_put_u64_64bit(skb, TCA_CAKE_ACTIVE_QUEUES, q->active_queues,1))
+		goto nla_put_failure;
+	if (nla_put_u32(skb, TCA_CAKE_MIN_TIMER_SLACK, q->min_timer_slack))
+		goto nla_put_failure;
+	if (nla_put_u32(skb, TCA_CAKE_MAX_TIMER_SLACK, q->max_timer_slack))
+		goto nla_put_failure;
+	if (nla_put_u32(skb, TCA_CAKE_AVG_TIMER_SLACK, q->avg_timer_slack))
 		goto nla_put_failure;
 
 	return nla_nest_end(skb, opts);
