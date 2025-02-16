@@ -2002,15 +2002,11 @@ static struct sk_buff *cake_dequeue(struct Qdisc *sch)
 			WRITE_ONCE(q->qdisc_wd_active[other_priv->txq_num], other_pkts_sent);
 		}
 		rcu_read_unlock();
-
-		// if (q->active_queues == 0) {
-		// 	ktime_t t1 = ktime_get();
-		// 	pr_err("loop time: %llu\n", t1-now);
-		// }
 		if (num_active_qs)
 			new_rate=div64_u64(q->rate_bps, num_active_qs);
 
 		q->active_queues = num_active_qs;
+
 		// mtu = 0 is used to only update the rate and not mess with cobalt params
 		cake_set_rate(b, new_rate, 0, 0, 0);
 		q->last_checked_active = now;
